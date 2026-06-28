@@ -46,7 +46,7 @@ pub async fn run_http_server(state: Arc<HttpState>, bind_addr: &str) {
 }
 
 pub async fn handle_connection(stream: &mut tokio::net::TcpStream, state: Arc<HttpState>) -> std::io::Result<()> {
-    let mut buf = vec![0u8; 8192];
+    let mut buf = vec![0u8; 16384];
     let n = stream.read(&mut buf).await?;
     if n == 0 {
         return Ok(());
@@ -64,12 +64,49 @@ pub async fn handle_connection(stream: &mut tokio::net::TcpStream, state: Arc<Ht
             .and_then(|s| s.split_whitespace().next())
             .unwrap_or("");
         serve_file(stream, state, hash).await
+    } else if request.starts_with("DELETE /files/") {
+        let hash = request
+            .strip_prefix("DELETE /files/")
+            .and_then(|s| s.split_whitespace().next())
+            .unwrap_or("");
+        handle_delete(stream, state, hash).await
     } else if request.starts_with("GET / ") || request.starts_with("GET / HTTP") || request.starts_with("GET /\r\n") {
         let body = status_html(&state);
         write_response(stream, "text/html; charset=utf-8", body.as_bytes()).await
     } else {
         write_response(stream, "text/plain", b"Not Found").await
     }
+}
+
+async fn handle_delete(stream: &mut tokio::net::TcpStream, state: Arc<HttpState>, root_hash: &str) -> std::io::Result<()> {
+    if root_hash.len() != 64 {
+        return write_error(stream, 400, "Invalid root hash (expected 64 hex chars)").await;
+    }
+
+    let mut file_index = FileIndex::load(&state.store_dir);
+    let before = file_index.files.len();
+    file_index.files.retain(|f| f.root_hash != root_hash);
+    if file_index.files.len() == before {
+        return write_error(stream, 404, "File not found in index").await;
+    }
+    file_index.save(&state.store_dir).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+
+    // Delete chunk files from disk (best-effort, by pattern matching hash prefix)
+    if let Ok(entries) = std::fs::read_dir(state.store_dir.join("chunks")) {
+        for entry in entries.flatten() {
+            let fname = entry.file_name().to_string_lossy().to_string();
+            if fname.starts_with(root_hash) || fname.contains(root_hash) {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+
+    write_json_response(stream, &serde_json::json!({"ok": true, "action": "deleted", "root_hash": root_hash})).await
+}
+
+async fn write_json_response(stream: &mut tokio::net::TcpStream, value: &serde_json::Value) -> std::io::Result<()> {
+    let body = serde_json::to_string(value).unwrap_or_default();
+    write_response(stream, "application/json", body.as_bytes()).await
 }
 
 async fn write_response(stream: &mut tokio::net::TcpStream, content_type: &str, body: &[u8]) -> std::io::Result<()> {
@@ -275,13 +312,14 @@ fn status_html(state: &HttpState) -> String {
             else if f.size < 1024 * 1024 { format!("{:.1} KB", f.size as f64 / 1024.0) }
             else { format!("{:.1} MB", f.size as f64 / (1024.0 * 1024.0)) };
         format!(
-            r#"<div class="item">
+            r#"<div class="item" data-hash="{hash}">
   <div class="top">
     <a class="fname" href="/download/{hash}">{name}</a>
     <span class="fsize">{size}</span>
   </div>
   <div class="hrow">
     <code class="chip" data-copy="{hash}">{short}</code>
+    <button class="delbtn" data-hash="{hash}" title="Delete">&#10005;</button>
   </div>
 </div>"#,
             hash = f.root_hash,
@@ -355,6 +393,12 @@ h2{{font-size:1.12em;font-weight:900;margin:2rem 0 .5rem}}
 .item .chip:hover{{color:var(--accent)}}
 .empty{{color:var(--muted);font-weight:600;text-align:center;padding:1.5rem 0}}
 .foot{{margin-top:2.5rem;text-align:center;color:var(--muted);font-size:.8em;font-weight:600}}
+.delbtn{{border:0;background:none;color:var(--muted);font:inherit;font-size:.82em;font-weight:700;cursor:pointer;padding:0;margin-left:.5rem}}
+.delbtn:hover{{color:var(--accent)}}
+.loading{{opacity:.6;pointer-events:none}}
+.upload-area{{margin-top:1rem;padding:.8rem;border:2px dashed var(--line);border-radius:14px;text-align:center;cursor:pointer;transition:border-color .12s}}
+.upload-area:hover{{border-color:var(--accent)}}
+.upload-area input{{display:none}}
 </style>
 </head>
 <body>
@@ -362,17 +406,63 @@ h2{{font-size:1.12em;font-weight:900;margin:2rem 0 .5rem}}
 (function(){{
   var r=document.documentElement;
   try{{var t=localStorage.getItem('dstore-theme')||((window.matchMedia&&matchMedia('(prefers-color-scheme:dark)').matches)?'dark':'light');r.setAttribute('data-theme',t);}}catch(e){{}}
-  document.querySelectorAll('[data-copy]').forEach(function(b){{
-    b.addEventListener('click',function(){{
-      var t=b.getAttribute('data-copy');
-      navigator.clipboard.writeText(t).then(function(){{
-        var o=b.textContent;
-        b.textContent='copied';
-        b.classList.add('copied');
-        setTimeout(function(){{b.textContent=o;b.classList.remove('copied');}},1200);
-      }});
+
+  // Copy-to-clipboard
+  document.addEventListener('click',function(e){{
+    var b=e.target.closest('[data-copy]');
+    if(!b)return;
+    var t=b.getAttribute('data-copy');
+    navigator.clipboard.writeText(t).then(function(){{
+      var o=b.textContent;
+      b.textContent='copied';
+      b.classList.add('copied');
+      setTimeout(function(){{b.textContent=o;b.classList.remove('copied');}},1200);
     }});
   }});
+
+  // Delete handler
+  document.addEventListener('click',function(e){{
+    var b=e.target.closest('.delbtn');
+    if(!b||!confirm('Delete this file?'))return;
+    var hash=b.getAttribute('data-hash');
+    var item=b.closest('.item');
+    item.classList.add('loading');
+    fetch('/files/'+hash,{{method:'DELETE'}})
+      .then(function(r){{return r.json()}})
+      .then(function(d){{
+        if(d.ok)item.remove();
+        else alert('Delete failed: '+JSON.stringify(d));
+      }})
+      .catch(function(e){{alert('Error: '+e);item.classList.remove('loading');}});
+  }});
+
+  // Auto-refresh peers+files every 5s
+  setInterval(function(){{
+    fetch('/status').then(function(r){{return r.json()}}).then(function(d){{
+      // Update peer count
+      var pc=document.getElementById('peer-count');
+      if(pc)pc.textContent=d.peer_count;
+      // Update file count
+      var fc=document.getElementById('file-count');
+      if(fc)fc.textContent=d.files.length;
+      // Update peers
+      var pl=document.getElementById('peer-list');
+      if(pl&&d.peers.length>0){{
+        pl.innerHTML=d.peers.map(function(p){{return '<div class=\"peer\"><code data-copy=\"'+p.id+'\">'+p.id.slice(0,16)+'</code><span class=\"addr\">'+p.addr+':'+p.tcp_port+'</span></div>'}}).join('');
+      }}
+      // Update chunks count
+      var cc=document.getElementById('chunk-count');
+      if(cc)cc.textContent=d.chunk_count;
+      // Update uptime
+      var up=document.getElementById('uptime-display');
+      if(up){{
+        var s=d.uptime_secs;
+        var h=Math.floor(s/3600);s%=3600;
+        var m=Math.floor(s/60);s%=60;
+        up.textContent=(h<10?'0':'')+h+'h '+(m<10?'0':'')+m+'m '+(s<10?'0':'')+s+'s';
+      }}
+    }}).catch(function(){{}});
+  }},5000);
 }})();
 </script>
 <div class="shell">
@@ -387,15 +477,15 @@ h2{{font-size:1.12em;font-weight:900;margin:2rem 0 .5rem}}
 <div class="box">
   <div class="statrow">
     <div class="stat"><dt>Node</dt><dd><code class="chip" data-copy="{node_id}">{node_short}</code></dd></div>
-    <div class="stat"><dt>Uptime</dt><dd>{uptime_str}</dd></div>
+    <div class="stat"><dt>Uptime</dt><dd id="uptime-display">{uptime_str}</dd></div>
     <div class="stat"><dt>TCP Port</dt><dd>{tcp_port}</dd></div>
-    <div class="stat"><dt>Chunks</dt><dd>{num_chunks}</dd></div>
+    <div class="stat"><dt>Chunks</dt><dd id="chunk-count">{num_chunks}</dd></div>
   </div>
 </div>
-<h2>Peers ({peer_count})</h2>
-<div class="box">{peer_rows}</div>
-<h2>Files ({file_count})</h2>
-<div class="items">{file_items}</div>
+<h2>Peers (<span id="peer-count">{peer_count}</span>)</h2>
+<div class="box" id="peer-list">{peer_rows}</div>
+<h2>Files (<span id="file-count">{file_count}</span>)</h2>
+<div class="items" id="file-list">{file_items}</div>
 <div class="empty">{empty_msg}</div>
 <div class="foot">dstore &middot; decentralized file storage</div>
 </div>

@@ -956,48 +956,74 @@ async fn run_watcher(
     chunk_dir: &Path,
     passphrase: Option<String>,
 ) -> Result<()> {
-    use inotify::{Inotify, WatchMask};
+    use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
     use std::time::Duration;
+    use tokio::sync::mpsc;
 
     let dir = Path::new(dir_path);
     if !dir.is_dir() {
         anyhow::bail!("not a directory: {}", dir_path);
     }
 
-    let mut inotify = Inotify::init()?;
-    inotify.watches().add(dir, WatchMask::CLOSE_WRITE | WatchMask::MOVED_TO)?;
+    let (tx, mut rx) = mpsc::channel::<Result<Event, notify::Error>>(256);
+    let mut watcher = RecommendedWatcher::new(
+        move |res| {
+            let _ = tx.blocking_send(res);
+        },
+        Config::default().with_poll_interval(Duration::from_secs(2)),
+    )?;
+    watcher.watch(dir, RecursiveMode::NonRecursive)?;
     tracing::info!("Watcher started for: {}", dir_path);
 
-    let mut buffer = [0u8; 4096];
-    loop {
-        let events = inotify
-            .read_events_blocking(&mut buffer)
-            .map_err(|e| anyhow::anyhow!("inotify read error: {}", e))?;
+    let mut last_events: Vec<(std::time::Instant, std::path::PathBuf)> = Vec::new();
 
-        for event in events {
-            let Some(name) = event.name else { continue };
-            let full_path = dir.join(name);
-            if !full_path.is_file() {
+    while let Some(res) = rx.recv().await {
+        let event = match res {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!("Watcher error: {}", e);
                 continue;
             }
-            // Skip hidden files and temp files
-            let name_str = name.to_string_lossy();
-            if name_str.starts_with('.') || name_str.ends_with('~') || name_str.ends_with(".tmp") {
-                continue;
+        };
+
+        let path = match event.paths.first() {
+            Some(p) if p.is_file() => p.clone(),
+            _ => continue,
+        };
+
+        // Filter by event kind
+        match event.kind {
+            EventKind::Create(_) | EventKind::Modify(_) => {}
+            _ => continue,
+        }
+
+        // Skip hidden/temp files
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        if name.starts_with('.') || name.ends_with('~') || name.ends_with(".tmp") {
+            continue;
+        }
+
+        // Debounce: skip if same path seen within 1 second
+        let now = std::time::Instant::now();
+        last_events.retain(|(t, _)| now.duration_since(*t).as_millis() < 1000);
+        if last_events.iter().any(|(_, p)| p == &path) {
+            continue;
+        }
+        last_events.push((now, path.clone()));
+
+        // Brief delay to let the write finish
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let store = ChunkStore::new(chunk_dir.to_path_buf());
+        match handle_daemon_store(&node, &store, &path.to_string_lossy(), passphrase.clone()).await {
+            Ok(root_hash) => {
+                tracing::info!("Auto-stored {} -> {}", path.display(), root_hash);
             }
-            // Brief delay to let the write finish
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            let store = ChunkStore::new(chunk_dir.to_path_buf());
-            match handle_daemon_store(&node, &store, &full_path.to_string_lossy(), passphrase.clone()).await {
-                Ok(root_hash) => {
-                    tracing::info!("Auto-stored {} -> {}", full_path.display(), root_hash);
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to auto-store {}: {}", full_path.display(), e);
-                }
+            Err(e) => {
+                tracing::warn!("Failed to auto-store {}: {}", path.display(), e);
             }
         }
     }
+    Ok(())
 }
 
 async fn handle_daemon_get(

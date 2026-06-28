@@ -6,3 +6,4 @@ files.json
 node_key
 *.sock
 .env
+.github/
